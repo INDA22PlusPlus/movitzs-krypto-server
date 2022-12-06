@@ -1,0 +1,2 @@
+[global.databases.dev_db]
+url = "postgres://admin:password@localhost/q1fs?sslmode=disable"
