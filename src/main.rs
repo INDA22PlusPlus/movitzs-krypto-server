@@ -174,7 +174,8 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
     let pq = &PQ.get().unwrap().db;
 
     let mut q =
-        "INSERT INTO nodes (hash, parent_hash, metadata, metadata_hash, is_dir) VALUES ".to_owned();
+        "INSERT INTO nodes (hash, parent_hash, metadata, metadata_hash, data_hash, is_dir) VALUES "
+            .to_owned();
 
     let mut args: Vec<&(dyn tokio_postgres::types::ToSql + std::marker::Sync)> =
         Vec::with_capacity(5 * new_context.len());
@@ -185,12 +186,31 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
     for (i, node) in new_context.iter().enumerate() {
         if !node.parent_hash.is_empty() {
             q.push_str(
-                format!("(${},${},${},${},${})", x + 1, x + 2, x + 3, x + 4, x + 5).as_str(),
+                format!(
+                    "(${},${},${},${},${},${})",
+                    x + 1,
+                    x + 2,
+                    x + 3,
+                    x + 4,
+                    x + 5,
+                    x + 6
+                )
+                .as_str(),
+            );
+            x += 6;
+        } else {
+            q.push_str(
+                format!(
+                    "(${},NULL,${},${},${},${})",
+                    x + 1,
+                    x + 2,
+                    x + 3,
+                    x + 4,
+                    x + 5
+                )
+                .as_str(),
             );
             x += 5;
-        } else {
-            q.push_str(format!("(${},NULL,${},${},${})", x + 1, x + 2, x + 3, x + 4).as_str());
-            x += 4;
         }
 
         if i != new_context.len() - 1 {
@@ -203,6 +223,8 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         }
         args.push(&node.metadata);
         args.push(&node.metadata_hash);
+        args.push(&node.data_hash);
+
         args.push(&node.is_dir);
 
         if node.parent_hash.is_empty() {
@@ -293,6 +315,7 @@ struct Node {
     hash: String,
     metadata: String,
     metadata_hash: String,
+    data_hash: String,
     parent_hash: String,
     is_dir: bool,
 }
@@ -302,6 +325,7 @@ struct InternalNode {
     hash: Vec<u8>,
     metadata: Vec<u8>,
     metadata_hash: Vec<u8>,
+    data_hash: Vec<u8>,
     parent_hash: Vec<u8>,
     is_dir: bool,
 }
@@ -312,7 +336,7 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 
     let children = pq
         .query(
-            "SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE parent_hash = $1;",
+            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE parent_hash = $1;",
             &[&hex::decode(hash).unwrap()],
         )
         .await
@@ -324,9 +348,9 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Row>, ()> {
     let pq = &PQ.get().unwrap().db;
     let query = "WITH RECURSIVE higher_nodes(n) AS (
-        SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE hash = $1
+        SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE hash = $1
         UNION ALL
-        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.is_dir
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
         FROM higher_nodes hn, nodes n
         WHERE n.hash = hn.parent_hash OR n.parent_hash = hn.parent_hash
     ) SELECT * FROM higher_nodes;";
@@ -344,6 +368,7 @@ fn externalize_node(nodes: Vec<InternalNode>) -> Vec<Node> {
             metadata: base64::encode(&n.metadata),
             parent_hash: hex::encode(&n.parent_hash),
             metadata_hash: hex::encode(&n.metadata_hash),
+            data_hash: hex::encode(&n.data_hash),
             is_dir: n.is_dir,
         })
         .collect()
@@ -358,7 +383,8 @@ fn convert_node(row: &Row) -> Node {
         metadata: base64::encode(row.get::<usize, Vec<u8>>(1)),
         parent_hash: hex::encode(row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
         metadata_hash: hex::encode(row.get::<usize, Vec<u8>>(3)),
-        is_dir: row.get::<usize, bool>(4),
+        data_hash: hex::encode(row.get::<usize, Vec<u8>>(4)),
+        is_dir: row.get::<usize, bool>(5),
     }
 }
 
@@ -371,7 +397,8 @@ fn iconvert_node(row: &Row) -> InternalNode {
         metadata: (row.get::<usize, Vec<u8>>(1)),
         parent_hash: (row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
         metadata_hash: (row.get::<usize, Vec<u8>>(3)),
-        is_dir: row.get::<usize, bool>(4),
+        data_hash: row.get::<usize, Vec<u8>>(4),
+        is_dir: row.get::<usize, bool>(5),
     }
 }
 
