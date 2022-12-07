@@ -10,7 +10,6 @@ use std::env;
 use ::serde::{Deserialize, Serialize};
 use crypto::digest::Digest;
 use crypto::sha2::Sha384;
-use hex::{FromHex, FromHexError};
 use once_cell::sync::OnceCell;
 use rocket::*;
 use rocket::{serde::json::Json, tokio};
