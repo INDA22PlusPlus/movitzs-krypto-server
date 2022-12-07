@@ -937,6 +937,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64",
  "dotenvy",
+ "hex",
  "once_cell",
  "regex",
  "rocket",
