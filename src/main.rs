@@ -88,7 +88,7 @@ async fn new_root(payload: Json<InitPayload<'_>>) -> Json<InitResponse> {
     }
 
     pq.execute(
-        "INSERT INTO nodes (hash,  metadata, metadata_hash, is_dir) VALUES ($1,$2,$3, true);",
+        "INSERT INTO nodes (hash,  metadata, metadata_hash, data_hash, is_dir) VALUES ($1,$2,$3, NULL, true);",
         &[&node_hash.to_vec(), &raw_meta, &meta_hash.to_vec()],
     )
     .await
@@ -138,16 +138,18 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         h.result(&mut meta_hash);
     }
 
+    let content_hash = if payload.content_hash.is_none() {
+        None
+    } else {
+        Some(hex::decode(payload.content_hash.unwrap()).unwrap())
+    };
+
     let mut node_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(&meta_hash);
         if payload.content_length.is_some() {
-            h.input(
-                hex::decode(payload.content_hash.unwrap())
-                    .unwrap()
-                    .as_slice(),
-            );
+            h.input(content_hash.unwrap().as_slice());
         }
         h.result(&mut node_hash);
     }
@@ -164,6 +166,7 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         metadata: raw_meta,
         parent_hash: parent_hash.clone(),
         metadata_hash: meta_hash.to_vec(),
+        data_hash: meta_hash.to_vec(),
         is_dir: payload.is_dir,
     };
 
@@ -171,6 +174,16 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
     new_context.push(new_node);
     let new_context = update_tree(parent_hash, new_context);
 
+    let top_hash = insert_tree(&new_context).await;
+
+    Ok(Json(InsertResponse {
+        old_tree: externalize_node(context),
+        new_tree: externalize_node(new_context),
+        new_top_hash: hex::encode(top_hash),
+    }))
+}
+
+async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
     let pq = &PQ.get().unwrap().db;
 
     let mut q =
@@ -238,11 +251,7 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         .await
         .unwrap();
 
-    Ok(Json(InsertResponse {
-        old_tree: externalize_node(context),
-        new_tree: externalize_node(new_context),
-        new_top_hash: hex::encode(top_hash),
-    }))
+    top_hash
 }
 
 fn update_tree(tbu: Vec<u8>, mut context: Vec<InternalNode>) -> Vec<InternalNode> {
@@ -263,19 +272,23 @@ fn update_tree(tbu: Vec<u8>, mut context: Vec<InternalNode>) -> Vec<InternalNode
 
         let mut back_prop = vec![];
 
-        let mut i = 0;
-        while i < context.len() {
-            let node = &context[i];
+        if context[tbun_idx].is_dir {
+            let mut i = 0;
+            while i < context.len() {
+                let node = &context[i];
 
-            if node.parent_hash == context[tbun_idx].hash {
-                new_hash.input(&node.hash);
-                back_prop.push(i);
-            }
+                if node.parent_hash == context[tbun_idx].hash {
+                    new_hash.input(&node.hash);
+                    back_prop.push(i);
+                }
 
-            if node.hash == context[tbun_idx].parent_hash {
-                next_ti = i;
+                if node.hash == context[tbun_idx].parent_hash {
+                    next_ti = i;
+                }
+                i += 1;
             }
-            i += 1;
+        } else {
+            new_hash.input(context[tbun_idx].data_hash.as_slice());
         }
 
         new_hash.result(&mut context[tbun_idx].hash);
@@ -300,7 +313,7 @@ async fn get_node(hash: String) -> Json<Node> {
 
     let row = pq
         .query_one(
-            "SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE hash = $1;",
+            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE hash = $1;",
             &[&hex::decode(hash).unwrap()],
         )
         .await
