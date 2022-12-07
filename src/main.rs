@@ -115,11 +115,18 @@ struct InsertPayload<'r> {
     content_hash: Option<&'r str>,
     content_length: Option<u32>,
 }
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct InsertResponse {
+    old_tree: Vec<Node>,
+    new_tree: Vec<Node>,
+    new_top_hash: String,
+}
 
 #[post("/node", data = "<payload>")]
-async fn upload(payload: Json<InsertPayload<'_>>) -> &'static str {
+async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>, &str> {
     if payload.is_dir && payload.content_length.is_some() {
-        return "dir can't contain data";
+        return Err("dir can't contain data");
     }
 
     let raw_meta = base64::decode(payload.metadata).unwrap();
@@ -148,10 +155,11 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> &'static str {
     let context = get_tree_context(hex::decode(payload.parent_hash).unwrap())
         .await
         .unwrap();
+    let context = iconvert_nodes(context);
 
     let parent_hash = hex::decode(payload.parent_hash).unwrap();
 
-    let new_node = Node {
+    let new_node = InternalNode {
         hash: node_hash.to_vec(),
         metadata: raw_meta,
         parent_hash: parent_hash.clone(),
@@ -173,21 +181,32 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> &'static str {
 
     let mut top_hash = vec![];
 
+    let mut x = 0;
     for (i, node) in new_context.iter().enumerate() {
-        let x = i * 5;
-        q.push_str(format!("(${},${},${},${},${})", x + 1, x + 2, x + 3, x + 4, x + 5).as_str());
-        if i - 1 != new_context.len() {
+        if !node.parent_hash.is_empty() {
+            q.push_str(
+                format!("(${},${},${},${},${})", x + 1, x + 2, x + 3, x + 4, x + 5).as_str(),
+            );
+            x += 5;
+        } else {
+            q.push_str(format!("(${},NULL,${},${},${})", x + 1, x + 2, x + 3, x + 4).as_str());
+            x += 4;
+        }
+
+        if i != new_context.len() - 1 {
             q.push(',');
         }
 
         args.push(&node.hash);
-        args.push(&node.parent_hash);
+        if !node.parent_hash.is_empty() {
+            args.push(&node.parent_hash);
+        }
         args.push(&node.metadata);
         args.push(&node.metadata_hash);
         args.push(&node.is_dir);
 
         if node.parent_hash.is_empty() {
-            top_hash = node.parent_hash.clone();
+            top_hash = node.hash.clone();
         }
     }
 
@@ -197,10 +216,14 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> &'static str {
         .await
         .unwrap();
 
-    "Hello, world!"
+    Ok(Json(InsertResponse {
+        old_tree: externalize_node(context),
+        new_tree: externalize_node(new_context),
+        new_top_hash: hex::encode(top_hash),
+    }))
 }
 
-fn update_tree(tbu: Vec<u8>, mut context: Vec<Node>) -> Vec<Node> {
+fn update_tree(tbu: Vec<u8>, mut context: Vec<InternalNode>) -> Vec<InternalNode> {
     // will this be very slow? yes, i don't care
     // can't be bothered to build trees
 
@@ -245,14 +268,37 @@ fn update_tree(tbu: Vec<u8>, mut context: Vec<Node>) -> Vec<Node> {
 }
 
 #[delete("/node/<hash>")]
-fn delete(hash: String) -> &'static str {
-    _ = hash;
-    "Hello, world!"
+fn delete(hash: String) -> Json<Node> {
+    panic!("")
+}
+
+#[get("/node/<hash>")]
+async fn get_node(hash: String) -> Json<Node> {
+    let pq = &PQ.get().unwrap().db;
+
+    let row = pq
+        .query_one(
+            "SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE hash = $1;",
+            &[&hex::decode(hash).unwrap()],
+        )
+        .await
+        .unwrap();
+
+    Json(convert_node(&row))
 }
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(crate = "rocket::serde")]
 struct Node {
+    hash: String,
+    metadata: String,
+    metadata_hash: String,
+    parent_hash: String,
+    is_dir: bool,
+}
+
+#[derive(Clone)]
+struct InternalNode {
     hash: Vec<u8>,
     metadata: Vec<u8>,
     metadata_hash: Vec<u8>,
@@ -266,8 +312,8 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 
     let children = pq
         .query(
-            "SELECT hash, metadata, parent_hash, metadata_hash FROM nodes WHERE hash = $1;",
-            &[&hash],
+            "SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE parent_hash = $1;",
+            &[&hex::decode(hash).unwrap()],
         )
         .await
         .unwrap();
@@ -275,7 +321,7 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
     Json(convert_nodes(children))
 }
 
-async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Node>, ()> {
+async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Row>, ()> {
     let pq = &PQ.get().unwrap().db;
     let query = "WITH RECURSIVE higher_nodes(n) AS (
         SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE hash = $1
@@ -287,19 +333,46 @@ async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Node>, ()> {
 
     let children = pq.query(query, &[&hash]).await.unwrap();
 
-    Ok(convert_nodes(children))
+    Ok(children)
+}
+
+fn externalize_node(nodes: Vec<InternalNode>) -> Vec<Node> {
+    nodes
+        .iter()
+        .map(|n| Node {
+            hash: hex::encode(&n.hash),
+            metadata: base64::encode(&n.metadata),
+            parent_hash: hex::encode(&n.parent_hash),
+            metadata_hash: hex::encode(&n.metadata_hash),
+            is_dir: n.is_dir,
+        })
+        .collect()
 }
 
 fn convert_nodes(rows: Vec<Row>) -> Vec<Node> {
-    rows.iter()
-        .map(|row| Node {
-            hash: row.get::<usize, Vec<u8>>(0),
-            metadata: row.get::<usize, Vec<u8>>(1),
-            parent_hash: row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default(),
-            metadata_hash: row.get::<usize, Vec<u8>>(3),
-            is_dir: row.get::<usize, bool>(4),
-        })
-        .collect()
+    rows.iter().map(convert_node).collect()
+}
+fn convert_node(row: &Row) -> Node {
+    Node {
+        hash: hex::encode(row.get::<usize, Vec<u8>>(0)),
+        metadata: base64::encode(row.get::<usize, Vec<u8>>(1)),
+        parent_hash: hex::encode(row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
+        metadata_hash: hex::encode(row.get::<usize, Vec<u8>>(3)),
+        is_dir: row.get::<usize, bool>(4),
+    }
+}
+
+fn iconvert_nodes(rows: Vec<Row>) -> Vec<InternalNode> {
+    rows.iter().map(iconvert_node).collect()
+}
+fn iconvert_node(row: &Row) -> InternalNode {
+    InternalNode {
+        hash: (row.get::<usize, Vec<u8>>(0)),
+        metadata: (row.get::<usize, Vec<u8>>(1)),
+        parent_hash: (row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
+        metadata_hash: (row.get::<usize, Vec<u8>>(3)),
+        is_dir: row.get::<usize, bool>(4),
+    }
 }
 
 #[rocket::launch]
@@ -311,5 +384,8 @@ async fn rocket() -> _ {
         panic!("sadge");
     }
 
-    rocket::build().mount("/api", routes![upload, children, delete, new_root])
+    rocket::build().mount(
+        "/api",
+        routes![upload, children, delete, new_root, get_node],
+    )
 }
