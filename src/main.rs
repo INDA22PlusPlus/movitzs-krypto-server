@@ -61,20 +61,26 @@ struct InitPayload<'r> {
     username: &'r str,
 }
 
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct InitResponse {
+    top_hash: String,
+}
+
 #[post("/root", data = "<payload>")]
-async fn new_root(payload: Json<InitPayload<'_>>) -> &'static str {
+async fn new_root(payload: Json<InitPayload<'_>>) -> Json<InitResponse> {
     let pq = &PQ.get().unwrap().db;
 
     let raw_meta = base64::decode(payload.metadata).unwrap();
 
-    let mut meta_hash: [u8; 84] = [0; 84];
+    let mut meta_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(raw_meta.as_slice());
         h.result(&mut meta_hash);
     }
 
-    let mut node_hash: [u8; 84] = [0; 84];
+    let mut node_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(&meta_hash);
@@ -82,20 +88,22 @@ async fn new_root(payload: Json<InitPayload<'_>>) -> &'static str {
     }
 
     pq.execute(
-        "INSERT INTO users (username, top_hash) VALUES ($1,$2);",
-        &[&payload.username, &meta_hash.to_vec()],
-    )
-    .await
-    .unwrap();
-
-    pq.execute(
-        "INSERT INTO nodes (hash,  metadata, metadata_hash) VALUES ($1,$2,$3);",
+        "INSERT INTO nodes (hash,  metadata, metadata_hash, is_dir) VALUES ($1,$2,$3, true);",
         &[&node_hash.to_vec(), &raw_meta, &meta_hash.to_vec()],
     )
     .await
     .unwrap();
 
-    ""
+    pq.execute(
+        "INSERT INTO users (username, top_hash) VALUES ($1,$2);",
+        &[&payload.username, &node_hash.to_vec()],
+    )
+    .await
+    .unwrap();
+
+    Json(InitResponse {
+        top_hash: hex::encode(node_hash),
+    })
 }
 
 #[derive(Deserialize)]
@@ -104,74 +112,90 @@ struct InsertPayload<'r> {
     is_dir: bool,
     metadata: &'r str,
     parent_hash: &'r str,
-    content_hash: &'r str,
-    content_length: u32,
+    content_hash: Option<&'r str>,
+    content_length: Option<u32>,
 }
 
 #[post("/node", data = "<payload>")]
 async fn upload(payload: Json<InsertPayload<'_>>) -> &'static str {
-    if payload.is_dir && payload.content_length != 0 {
+    if payload.is_dir && payload.content_length.is_some() {
         return "dir can't contain data";
     }
 
     let raw_meta = base64::decode(payload.metadata).unwrap();
 
-    let mut meta_hash: [u8; 84] = [0; 84];
+    let mut meta_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(raw_meta.as_slice());
         h.result(&mut meta_hash);
     }
 
-    let mut node_hash: [u8; 84] = [0; 84];
+    let mut node_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(&meta_hash);
-        if payload.content_length != 0 {
-            h.input(payload.content_hash.as_bytes());
+        if payload.content_length.is_some() {
+            h.input(
+                hex::decode(payload.content_hash.unwrap())
+                    .unwrap()
+                    .as_slice(),
+            );
         }
         h.result(&mut node_hash);
     }
 
-    let context = get_tree_context(payload.parent_hash.as_bytes().to_vec())
+    let context = get_tree_context(hex::decode(payload.parent_hash).unwrap())
         .await
         .unwrap();
 
-    let mut new_context = context.clone();
-
-    let parent_hash = payload.parent_hash.as_bytes();
+    let parent_hash = hex::decode(payload.parent_hash).unwrap();
 
     let new_node = Node {
         hash: node_hash.to_vec(),
         metadata: raw_meta,
-        parent_hash: parent_hash.to_vec(),
+        parent_hash: parent_hash.clone(),
         metadata_hash: meta_hash.to_vec(),
+        is_dir: payload.is_dir,
     };
+
+    let mut new_context = context.clone();
     new_context.push(new_node);
-    let new_context = update_tree(parent_hash.to_vec(), context);
+    let new_context = update_tree(parent_hash, new_context);
 
     let pq = &PQ.get().unwrap().db;
-    // i tried to do a transaction, but the borrows were too wierd
 
-    for node in new_context {
-        pq.execute(
-            "INSERT INTO nodes (hash, parent_hash, metadata, metadata_hash) VALUES ($1,$2,$3,$4);",
-            &[
-                &node.hash,
-                &node.parent_hash,
-                &node.metadata,
-                &node.metadata_hash,
-            ],
-        )
-        .await
-        .unwrap();
+    let mut q =
+        "INSERT INTO nodes (hash, parent_hash, metadata, metadata_hash, is_dir) VALUES ".to_owned();
+
+    let mut args: Vec<&(dyn tokio_postgres::types::ToSql + std::marker::Sync)> =
+        Vec::with_capacity(5 * new_context.len());
+
+    let mut top_hash = vec![];
+
+    for (i, node) in new_context.iter().enumerate() {
+        let x = i * 5;
+        q.push_str(format!("(${},${},${},${},${})", x + 1, x + 2, x + 3, x + 4, x + 5).as_str());
+        if i - 1 != new_context.len() {
+            q.push(',');
+        }
+
+        args.push(&node.hash);
+        args.push(&node.parent_hash);
+        args.push(&node.metadata);
+        args.push(&node.metadata_hash);
+        args.push(&node.is_dir);
 
         if node.parent_hash.is_empty() {
-            pq.execute("UPDATE users SET top_hash = $1;", &[&node.hash])
-                .await
-                .unwrap();
+            top_hash = node.parent_hash.clone();
         }
     }
+
+    pq.execute(&q, &args).await.unwrap();
+
+    pq.execute("UPDATE users SET top_hash = $1;", &[&top_hash])
+        .await
+        .unwrap();
 
     "Hello, world!"
 }
@@ -226,13 +250,14 @@ fn delete(hash: String) -> &'static str {
     "Hello, world!"
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(crate = "rocket::serde")]
 struct Node {
     hash: Vec<u8>,
     metadata: Vec<u8>,
     metadata_hash: Vec<u8>,
     parent_hash: Vec<u8>,
+    is_dir: bool,
 }
 
 #[get("/node/<hash>/children")]
@@ -253,9 +278,9 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Node>, ()> {
     let pq = &PQ.get().unwrap().db;
     let query = "WITH RECURSIVE higher_nodes(n) AS (
-        SELECT hash, metadata, parent_hash, metadata_hash FROM nodes WHERE hash = $1
+        SELECT hash, metadata, parent_hash, metadata_hash, is_dir FROM nodes WHERE hash = $1
         UNION ALL
-        SELECT n.hash, n.metadata, n.parent_hash, metadata_hash
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.is_dir
         FROM higher_nodes hn, nodes n
         WHERE n.hash = hn.parent_hash OR n.parent_hash = hn.parent_hash
     ) SELECT * FROM higher_nodes;";
@@ -270,8 +295,9 @@ fn convert_nodes(rows: Vec<Row>) -> Vec<Node> {
         .map(|row| Node {
             hash: row.get::<usize, Vec<u8>>(0),
             metadata: row.get::<usize, Vec<u8>>(1),
-            parent_hash: row.get::<usize, Vec<u8>>(2),
+            parent_hash: row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default(),
             metadata_hash: row.get::<usize, Vec<u8>>(3),
+            is_dir: row.get::<usize, bool>(4),
         })
         .collect()
 }

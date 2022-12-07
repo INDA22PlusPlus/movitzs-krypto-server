@@ -11,6 +11,6 @@ CREATE TABLE nodes (
 CREATE TABLE users (
     id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     username TEXT UNIQUE NOT NULL,
-    pake_verify TEXT NOT NULL,
+    -- pake_verify TEXT NOT NULL,
     top_hash BYTEA REFERENCES nodes(hash) NOT NULL CHECK (length(top_hash) = 48)
 );
