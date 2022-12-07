@@ -187,7 +187,7 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
     let pq = &PQ.get().unwrap().db;
 
     let mut q =
-        "INSERT INTO nodes (hash, parent_hash, metadata, metadata_hash, data_hash, is_dir) VALUES "
+        "INSERT INTO nodes (hash, parent_hash, data_hash, metadata, metadata_hash, is_dir) VALUES "
             .to_owned();
 
     let mut args: Vec<&(dyn tokio_postgres::types::ToSql + std::marker::Sync)> =
@@ -213,15 +213,7 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
             x += 6;
         } else {
             q.push_str(
-                format!(
-                    "(${},NULL,${},${},${},${})",
-                    x + 1,
-                    x + 2,
-                    x + 3,
-                    x + 4,
-                    x + 5
-                )
-                .as_str(),
+                format!("(${},NULL,NULL,${},${},${})", x + 1, x + 2, x + 3, x + 4,).as_str(),
             );
             x += 5;
         }
@@ -233,10 +225,10 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
         args.push(&node.hash);
         if !node.parent_hash.is_empty() {
             args.push(&node.parent_hash);
+            args.push(&node.data_hash);
         }
         args.push(&node.metadata);
         args.push(&node.metadata_hash);
-        args.push(&node.data_hash);
 
         args.push(&node.is_dir);
 
@@ -396,7 +388,7 @@ fn convert_node(row: &Row) -> Node {
         metadata: base64::encode(row.get::<usize, Vec<u8>>(1)),
         parent_hash: hex::encode(row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
         metadata_hash: hex::encode(row.get::<usize, Vec<u8>>(3)),
-        data_hash: hex::encode(row.get::<usize, Vec<u8>>(4)),
+        data_hash: hex::encode(row.get::<usize, Option<Vec<u8>>>(4).unwrap_or_default()),
         is_dir: row.get::<usize, bool>(5),
     }
 }
@@ -406,11 +398,11 @@ fn iconvert_nodes(rows: Vec<Row>) -> Vec<InternalNode> {
 }
 fn iconvert_node(row: &Row) -> InternalNode {
     InternalNode {
-        hash: (row.get::<usize, Vec<u8>>(0)),
-        metadata: (row.get::<usize, Vec<u8>>(1)),
-        parent_hash: (row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default()),
-        metadata_hash: (row.get::<usize, Vec<u8>>(3)),
-        data_hash: row.get::<usize, Vec<u8>>(4),
+        hash: row.get::<usize, Vec<u8>>(0),
+        metadata: row.get::<usize, Vec<u8>>(1),
+        parent_hash: row.get::<usize, Option<Vec<u8>>>(2).unwrap_or_default(),
+        metadata_hash: row.get::<usize, Vec<u8>>(3),
+        data_hash: row.get::<usize, Option<Vec<u8>>>(4).unwrap_or_default(),
         is_dir: row.get::<usize, bool>(5),
     }
 }
