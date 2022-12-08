@@ -191,13 +191,33 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
             .to_owned();
 
     let mut args: Vec<&(dyn tokio_postgres::types::ToSql + std::marker::Sync)> =
-        Vec::with_capacity(5 * new_context.len());
+        Vec::with_capacity(6 * new_context.len());
 
     let mut top_hash = vec![];
 
     let mut x = 0;
     for (i, node) in new_context.iter().enumerate() {
-        if !node.parent_hash.is_empty() {
+        if node.parent_hash.is_empty() {
+            // this can only be the root, which must be a dir
+            q.push_str(
+                format!("(${},NULL,NULL,${},${},${})", x + 1, x + 2, x + 3, x + 4,).as_str(),
+            );
+            x += 4;
+        } else if node.data_hash.is_empty() {
+            // a non-root directory
+            q.push_str(
+                format!(
+                    "(${},${},NULL,${},${},${})",
+                    x + 1,
+                    x + 2,
+                    x + 3,
+                    x + 4,
+                    x + 5,
+                )
+                .as_str(),
+            );
+            x += 5;
+        } else {
             q.push_str(
                 format!(
                     "(${},${},${},${},${},${})",
@@ -211,11 +231,6 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
                 .as_str(),
             );
             x += 6;
-        } else {
-            q.push_str(
-                format!("(${},NULL,NULL,${},${},${})", x + 1, x + 2, x + 3, x + 4,).as_str(),
-            );
-            x += 5;
         }
 
         if i != new_context.len() - 1 {
@@ -225,6 +240,8 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
         args.push(&node.hash);
         if !node.parent_hash.is_empty() {
             args.push(&node.parent_hash);
+        }
+        if !node.data_hash.is_empty() {
             args.push(&node.data_hash);
         }
         args.push(&node.metadata);
@@ -237,6 +254,7 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
         }
     }
 
+    q.push_str(" ON CONFLICT (hash) DO UPDATE SET parent_hash = EXCLUDED.parent_hash;");
     pq.execute(&q, &args).await.unwrap();
 
     pq.execute("UPDATE users SET top_hash = $1;", &[&top_hash])
@@ -325,7 +343,7 @@ struct Node {
     is_dir: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct InternalNode {
     hash: Vec<u8>,
     metadata: Vec<u8>,
@@ -352,13 +370,22 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 
 async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Row>, ()> {
     let pq = &PQ.get().unwrap().db;
-    let query = "WITH RECURSIVE higher_nodes(n) AS (
+    let query = "WITH RECURSIVE higher_nodes AS (
         SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE hash = $1
         UNION ALL
         SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
         FROM higher_nodes hn, nodes n
-        WHERE n.hash = hn.parent_hash OR n.parent_hash = hn.parent_hash
-    ) SELECT * FROM higher_nodes;";
+        WHERE n.hash = hn.parent_hash
+    ),
+    sibling_nodes AS (
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
+        FROM nodes n, higher_nodes hn WHERE n.parent_hash = hn.parent_hash
+    ),
+    context_root_children AS (
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
+        FROM nodes n WHERE n.parent_hash = $1
+    )
+    SELECT * FROM higher_nodes UNION SELECT * FROM sibling_nodes UNION SELECT * FROM context_root_children;";
 
     let children = pq.query(query, &[&hash]).await.unwrap();
 
