@@ -149,7 +149,7 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         let mut h = Sha384::new();
         h.input(&meta_hash);
         if payload.content_length.is_some() {
-            h.input(content_hash.unwrap().as_slice());
+            h.input(content_hash.as_ref().unwrap().as_slice());
         }
         h.result(&mut node_hash);
     }
@@ -166,7 +166,7 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         metadata: raw_meta,
         parent_hash: parent_hash.clone(),
         metadata_hash: meta_hash.to_vec(),
-        data_hash: meta_hash.to_vec(),
+        data_hash: content_hash.unwrap_or_default().to_vec(),
         is_dir: payload.is_dir,
     };
 
