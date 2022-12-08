@@ -5,7 +5,7 @@ extern crate rocket;
 extern crate tokio_postgres;
 
 use core::panic;
-use std::env;
+use std::{env, vec};
 
 use ::serde::{Deserialize, Serialize};
 use crypto::digest::Digest;
@@ -331,8 +331,32 @@ fn update_tree(tbu: Vec<u8>, mut context: Vec<InternalNode>) -> Vec<InternalNode
 }
 
 #[delete("/node/<hash>")]
-fn delete(hash: String) -> Json<Node> {
-    panic!("")
+async fn delete(hash: String) -> Json<InsertResponse> {
+    let node_hash = hex::decode(hash).unwrap();
+
+    let context = get_tree_context(node_hash.clone()).await.unwrap();
+    let context = iconvert_nodes(context);
+
+    let mut new_context = context.clone();
+
+    let mut parent_hash = vec![];
+    for (i, node) in new_context.iter().enumerate() {
+        if node.hash == node_hash {
+            parent_hash = node.parent_hash.clone();
+            new_context.remove(i);
+            break;
+        }
+    }
+
+    let new_context = update_tree(parent_hash, new_context);
+
+    let top_hash = insert_tree(&new_context).await;
+
+    Json(InsertResponse {
+        old_tree: externalize_node(context),
+        new_tree: externalize_node(new_context),
+        new_top_hash: hex::encode(top_hash),
+    })
 }
 
 #[get("/node/<hash>")]
