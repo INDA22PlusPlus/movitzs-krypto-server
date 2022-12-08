@@ -6,7 +6,8 @@ CREATE TABLE nodes (
     metadata_hash BYTEA NOT NULL CHECK (length(metadata_hash) = 48),
     data_hash BYTEA CHECK (length(data_hash) = 48),
     parent_hash BYTEA REFERENCES nodes(hash), -- length constriant implicit 
-    is_dir BOOLEAN NOT NULL
+    is_dir BOOLEAN NOT NULL,
+    data BYTEA
 );
 
 CREATE TABLE users (

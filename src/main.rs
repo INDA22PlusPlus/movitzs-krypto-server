@@ -112,8 +112,7 @@ struct InsertPayload<'r> {
     is_dir: bool,
     metadata: &'r str,
     parent_hash: &'r str,
-    content_hash: Option<&'r str>,
-    content_length: Option<u32>,
+    data: Option<&'r str>,
 }
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
@@ -125,7 +124,7 @@ struct InsertResponse {
 
 #[post("/node", data = "<payload>")]
 async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>, &str> {
-    if payload.is_dir && payload.content_length.is_some() {
+    if payload.is_dir && payload.data.is_some() {
         return Err("dir can't contain data");
     }
 
@@ -138,18 +137,21 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         h.result(&mut meta_hash);
     }
 
-    let content_hash = if payload.content_hash.is_none() {
-        None
-    } else {
-        Some(hex::decode(payload.content_hash.unwrap()).unwrap())
-    };
+    let raw_data = base64::decode(payload.data.unwrap_or_default()).unwrap();
+
+    let mut content_hash: [u8; 48] = [0; 48];
+    if payload.data.is_some() {
+        let mut h = Sha384::new();
+        h.input(raw_data.as_slice());
+        h.result(&mut content_hash);
+    }
 
     let mut node_hash: [u8; 48] = [0; 48];
     {
         let mut h = Sha384::new();
         h.input(&meta_hash);
-        if payload.content_length.is_some() {
-            h.input(content_hash.as_ref().unwrap().as_slice());
+        if payload.data.is_some() {
+            h.input(content_hash.as_slice());
         }
         h.result(&mut node_hash);
     }
@@ -166,8 +168,9 @@ async fn upload(payload: Json<InsertPayload<'_>>) -> Result<Json<InsertResponse>
         metadata: raw_meta,
         parent_hash: parent_hash.clone(),
         metadata_hash: meta_hash.to_vec(),
-        data_hash: content_hash.unwrap_or_default().to_vec(),
+        data_hash: content_hash.to_vec(),
         is_dir: payload.is_dir,
+        data: raw_data,
     };
 
     let mut new_context = context.clone();
@@ -195,8 +198,12 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
 
     let mut top_hash = vec![];
 
+    let mut new_node_idx = 123123;
     let mut x = 0;
     for (i, node) in new_context.iter().enumerate() {
+        if !node.data.is_empty() {
+            new_node_idx = i;
+        }
         if node.parent_hash.is_empty() {
             // this can only be the root, which must be a dir
             q.push_str(
@@ -261,6 +268,17 @@ async fn insert_tree(new_context: &Vec<InternalNode>) -> Vec<u8> {
         .await
         .unwrap();
 
+    if new_node_idx != 123123 {
+        pq.execute(
+            "UPDATE nodes SET data = $1 WHERE hash = $2",
+            &[
+                &new_context[new_node_idx].data,
+                &new_context[new_node_idx].hash,
+            ],
+        )
+        .await
+        .unwrap();
+    }
     top_hash
 }
 
@@ -323,7 +341,7 @@ async fn get_node(hash: String) -> Json<Node> {
 
     let row = pq
         .query_one(
-            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE hash = $1;",
+            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir, data FROM nodes WHERE hash = $1;",
             &[&hex::decode(hash).unwrap()],
         )
         .await
@@ -341,6 +359,7 @@ struct Node {
     data_hash: String,
     parent_hash: String,
     is_dir: bool,
+    data: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +370,7 @@ struct InternalNode {
     data_hash: Vec<u8>,
     parent_hash: Vec<u8>,
     is_dir: bool,
+    data: Vec<u8>,
 }
 
 #[get("/node/<hash>/children")]
@@ -359,7 +379,7 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 
     let children = pq
         .query(
-            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE parent_hash = $1;",
+            "SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir, NULL::BYTEA FROM nodes WHERE parent_hash = $1;",
             &[&hex::decode(hash).unwrap()],
         )
         .await
@@ -371,18 +391,18 @@ async fn children(hash: &str) -> Json<Vec<Node>> {
 async fn get_tree_context(hash: Vec<u8>) -> Result<Vec<Row>, ()> {
     let pq = &PQ.get().unwrap().db;
     let query = "WITH RECURSIVE higher_nodes AS (
-        SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir FROM nodes WHERE hash = $1
+        SELECT hash, metadata, parent_hash, metadata_hash, data_hash, is_dir, NULL FROM nodes WHERE hash = $1
         UNION ALL
-        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir, NULL
         FROM higher_nodes hn, nodes n
         WHERE n.hash = hn.parent_hash
     ),
     sibling_nodes AS (
-        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir, NULL
         FROM nodes n, higher_nodes hn WHERE n.parent_hash = hn.parent_hash
     ),
     context_root_children AS (
-        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir
+        SELECT n.hash, n.metadata, n.parent_hash, n.metadata_hash, n.data_hash, n.is_dir, NULL
         FROM nodes n WHERE n.parent_hash = $1
     )
     SELECT * FROM higher_nodes UNION SELECT * FROM sibling_nodes UNION SELECT * FROM context_root_children;";
@@ -402,6 +422,7 @@ fn externalize_node(nodes: Vec<InternalNode>) -> Vec<Node> {
             metadata_hash: hex::encode(&n.metadata_hash),
             data_hash: hex::encode(&n.data_hash),
             is_dir: n.is_dir,
+            data: Some(base64::encode(&n.data)),
         })
         .collect()
 }
@@ -417,6 +438,9 @@ fn convert_node(row: &Row) -> Node {
         metadata_hash: hex::encode(row.get::<usize, Vec<u8>>(3)),
         data_hash: hex::encode(row.get::<usize, Option<Vec<u8>>>(4).unwrap_or_default()),
         is_dir: row.get::<usize, bool>(5),
+        data: Some(base64::encode(
+            row.get::<usize, Option<Vec<u8>>>(6).unwrap_or_default(),
+        )),
     }
 }
 
@@ -431,6 +455,7 @@ fn iconvert_node(row: &Row) -> InternalNode {
         metadata_hash: row.get::<usize, Vec<u8>>(3),
         data_hash: row.get::<usize, Option<Vec<u8>>>(4).unwrap_or_default(),
         is_dir: row.get::<usize, bool>(5),
+        data: Vec::new(),
     }
 }
 
